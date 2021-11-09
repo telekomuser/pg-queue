@@ -10,8 +10,7 @@ import java.time.LocalDateTime;
 public class Message {
     private final Long offset;//as ID
 
-    @Builder.Default
-    private final LocalDateTime dateAdded = LocalDateTime.now();
+    private final LocalDateTime dateAdded;
 
     @Builder.Default
     private final MessageState state = MessageState.ACCEPTED;

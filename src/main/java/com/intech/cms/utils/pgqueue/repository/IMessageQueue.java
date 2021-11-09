@@ -8,7 +8,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import java.util.List;
 
 public interface IMessageQueue {
-    long put(Message message);
+    Message put(Message message);
 
     List<Message> findNext(String consumerId, int limit) throws InterruptedException;
 

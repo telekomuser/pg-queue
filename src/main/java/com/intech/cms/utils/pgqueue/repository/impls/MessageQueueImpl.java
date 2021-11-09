@@ -18,6 +18,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import javax.sql.DataSource;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -27,12 +28,10 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 @Slf4j
-//TODO move all sql to templates
 public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
     private final NamedParameterJdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
 
-    private final String schema;
     private final String queueName;
     private final String tableName;
 
@@ -53,32 +52,34 @@ public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
                                String queueName) throws SQLException {
         this.jdbcTemplate = jdbcTemplate;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
-        this.schema = schema;
         this.queueName = queueName;
         this.tableName = String.format("%s.%s", schema, queueName);
         this.lock = new ReentrantLock();
         this.newMessageEvent = this.lock.newCondition();
-        addListener(this);
-    }
-
-    protected void init() {
-        createSchemaIfNotExists();
-        createTableIfNotExists();
+        addListener(getConnection(), this);
     }
 
     @Override
-    public long put(Message message) {
+    public Message put(Message message) {
         String sqlTemplate = "INSERT INTO %s (date_added, state, payload) VALUES (:date_added, :state, :payload)";
         String sql = String.format(sqlTemplate, tableName);
 
+        LocalDateTime dateAdded = LocalDateTime.now();
+
         SqlParameterSource params = new MapSqlParameterSource()
-                .addValue("date_added", message.getDateAdded())
+                .addValue("date_added", dateAdded)
                 .addValue("state", message.getState().getId())
                 .addValue("payload", message.getPayload());
         KeyHolder keyHolder = new GeneratedKeyHolder();
 
         jdbcTemplate.update(sql, params, keyHolder, new String[]{"id"});
-        return Objects.requireNonNull(keyHolder.getKeyAs(Long.class));
+
+        return Message.builder()
+                .offset(Objects.requireNonNull(keyHolder.getKeyAs(Long.class)))
+                .dateAdded(dateAdded)
+                .state(message.getState())
+                .payload(message.getPayload())
+                .build();
     }
 
     @Override
@@ -103,17 +104,6 @@ public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
         return selectAndUpdateState(consumerId, limit);
     }
 
-    private List<Message> selectAndUpdateState(String consumerId, int limit) {
-        String sqlTemplate = "SELECT * FROM %s WHERE state = 1 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT %d";
-        String sql = String.format(sqlTemplate, tableName, limit);
-
-        return transactionTemplate.execute(status ->
-                jdbcTemplate.query(sql, Collections.emptyMap(), messageMapper).stream()
-                        .map(message -> markAsSentTo(message, consumerId))
-                        .collect(Collectors.toList())
-        );
-    }
-
     @Override
     public void commitAllConsumedMessages(String consumerId) {
         String sql = String.format("UPDATE %s SET state = 3 WHERE consumer_id = :id AND state = 2", tableName);
@@ -130,7 +120,7 @@ public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
 
     @Override
     public void notification(int processId, String channelName, String payload) {
-        log.debug("got new notification from PID = {}, channel = {} with payload = {}", processId, channelName, payload);
+        log.trace("got new notification from PID = {}, channel = {} with payload = {}", processId, channelName, payload);
         try {
             this.lock.lock();
             this.newMessageEvent.signal();
@@ -141,16 +131,25 @@ public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
 
     @Override
     public void closed() {
-        log.debug("closed in listener");
-        //TODO
+        log.trace("lost connection, try reconnect...");
+        try {
+            PGConnection connection = getConnection();
+            log.trace("...connection restored, add listener");
+            addListener(connection, this);
+        } catch (SQLException e) {
+            //connection restore failed, perhaps application stopping
+        }
     }
 
-    private void createSchemaIfNotExists() {
-        //TODO
-    }
+    private List<Message> selectAndUpdateState(String consumerId, int limit) {
+        String sqlTemplate = "SELECT * FROM %s WHERE state = 1 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT %d";
+        String sql = String.format(sqlTemplate, tableName, limit);
 
-    private void createTableIfNotExists() {
-        //TODO
+        return transactionTemplate.execute(status ->
+                jdbcTemplate.query(sql, Collections.emptyMap(), messageMapper).stream()
+                        .map(message -> markAsSentTo(message, consumerId))
+                        .collect(Collectors.toList())
+        );
     }
 
     private Message markAsSentTo(Message message, String consumerId) {
@@ -172,13 +171,18 @@ public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
                 .build();
     }
 
-    private void addListener(PGNotificationListener listener) throws SQLException {
-        PGConnection connection = getDataSource().getConnection().unwrap(PGConnection.class);
+    private PGConnection getConnection() throws SQLException {
+        return getDataSource().getConnection().unwrap(PGConnection.class);
+    }
+
+    private void addListener(PGConnection connection, PGNotificationListener listener) throws SQLException {
         connection.addNotificationListener(this.queueName, listener);
-        Statement statement = connection.createStatement();
-        statement.execute(String.format("LISTEN %s", this.queueName));
-        statement.close();
-        log.debug("subscribed to channel: {}", this.queueName);
+
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(String.format("LISTEN %s", this.queueName));
+        }
+
+        log.trace("subscribed to channel: {}", this.queueName);
     }
 
     private DataSource getDataSource() {

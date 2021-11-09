@@ -19,6 +19,6 @@ public class MessageProducerImpl implements IMessageProducer {
         Message message = Message.builder()
                 .payload(serializer.serialize(payload))
                 .build();
-        return messageQueue.put(message);
+        return messageQueue.put(message).getOffset();
     }
 }
