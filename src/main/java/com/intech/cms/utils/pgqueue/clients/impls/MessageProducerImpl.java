@@ -1,24 +1,21 @@
 package com.intech.cms.utils.pgqueue.clients.impls;
 
-import com.intech.cms.utils.pgqueue.clients.IMessageProducer;
-import com.intech.cms.utils.pgqueue.clients.ISerializer;
-import com.intech.cms.utils.pgqueue.model.Message;
-import com.intech.cms.utils.pgqueue.repository.IMessageQueue;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import com.intech.cms.utils.pgqueue.clients.MessageProducer;
+import com.intech.cms.utils.pgqueue.clients.Serializer;
+import com.intech.cms.utils.pgqueue.repository.MessageQueue;
 
-@Slf4j
-@RequiredArgsConstructor
-public class MessageProducerImpl implements IMessageProducer {
+public class MessageProducerImpl implements MessageProducer {
 
-    private final ISerializer serializer;
-    private final IMessageQueue messageQueue;
+    private final Serializer serializer;
+    private final MessageQueue messageQueue;
+
+    protected MessageProducerImpl(Serializer serializer, MessageQueue messageQueue) {
+        this.serializer = serializer;
+        this.messageQueue = messageQueue;
+    }
 
     @Override
     public <T> long send(T payload) {
-        Message message = Message.builder()
-                .payload(serializer.serialize(payload))
-                .build();
-        return messageQueue.put(message).getOffset();
+        return messageQueue.put(serializer.serialize(payload)).getOffset();
     }
 }

@@ -10,5 +10,6 @@
     </root>
 
     <logger name="com.intech.cms.utils.pgqueue" level="trace"/>
+    <logger name="org.springframework.jdbc.core" level="debug"/>
 
 </configuration>

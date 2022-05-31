@@ -1,6 +1,6 @@
 package com.intech.cms.utils.pgqueue.clients;
 
-public interface ISerializer {
+public interface Serializer {
 
     String serialize(Object payload);
 

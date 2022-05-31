@@ -3,13 +3,13 @@ package com.intech.cms.utils.pgqueue.clients.impls;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.intech.cms.utils.pgqueue.clients.DeserializationException;
-import com.intech.cms.utils.pgqueue.clients.IDeserializer;
+import com.intech.cms.utils.pgqueue.clients.Deserializer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 @RequiredArgsConstructor
-public class JsonDeserializerImpl implements IDeserializer {
+public class JsonDeserializerImpl implements Deserializer {
 
     private final ObjectMapper om;
 

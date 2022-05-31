@@ -9,13 +9,9 @@ import java.time.LocalDateTime;
 @Builder
 public class Message {
     private final Long offset;//as ID
-
     private final LocalDateTime dateAdded;
-
-    @Builder.Default
-    private final MessageState state = MessageState.ACCEPTED;
-
+    private final MessageState state;
     private final String consumerId;
-
+    private final LocalDateTime stateUpdatedAt;
     private final String payload;
 }

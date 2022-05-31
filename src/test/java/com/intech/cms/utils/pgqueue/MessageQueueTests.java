@@ -1,38 +1,42 @@
 package com.intech.cms.utils.pgqueue;
 
-import com.impossibl.postgres.jdbc.PGDriver;
 import com.intech.cms.utils.pgqueue.model.Message;
 import com.intech.cms.utils.pgqueue.model.MessageState;
-import com.intech.cms.utils.pgqueue.repository.IMessageQueue;
+import com.intech.cms.utils.pgqueue.repository.MessageQueue;
 import lombok.extern.slf4j.Slf4j;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.function.ThrowingSupplier;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.postgresql.Driver;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.jdbc.datasource.SimpleDriverDataSource;
-import org.springframework.jdbc.support.JdbcTransactionManager;
+import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.context.jdbc.Sql;
+import org.springframework.test.context.jdbc.SqlGroup;
+import org.springframework.test.context.junit.jupiter.SpringExtension;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import javax.sql.DataSource;
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.time.LocalDateTime;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
-import static java.time.Duration.ofSeconds;
 import static org.junit.jupiter.api.Assertions.*;
 
 @Slf4j
+@ExtendWith(SpringExtension.class)
 @Testcontainers
+@ContextConfiguration(classes = MessageQueueTests.Configuration.class)
+@SqlGroup({
+        @Sql(scripts = "classpath:/sql/init-data.sql", executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD),
+        @Sql(scripts = "classpath:/sql/truncate.sql", executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
+})
 public class MessageQueueTests {
     private static final String SCHEMA_NAME = "queues";
     private static final String QUEUE_NAME = "test";
-    private static final String CONSUMER_ID = "1:1";
+    private static final String CONSUMER_ID = "consumerId";
 
     @Container
     private static final PostgreSQLContainer<?> postgreSQLContainer = new PostgreSQLContainer<>("postgres:13")
@@ -40,141 +44,118 @@ public class MessageQueueTests {
             .withUsername("postgres")
             .withPassword("postgres");
 
-    private static DataSource dataSource;
-    private static IMessageQueue queue;
+    @Autowired
+    private MessageQueue queue;
 
-    @BeforeAll
-    public static void beforeAll() {
-        dataSource = createDataSource();
-        queue = IMessageQueue.builder()
-                .jdbcTemplate(new NamedParameterJdbcTemplate(dataSource))
-                .transactionManager(new JdbcTransactionManager(dataSource))
-                .schema(SCHEMA_NAME)
-                .queueName(QUEUE_NAME)
-                .build();
+    @Test
+    public void testGetName() {
+        assertEquals(QUEUE_NAME, queue.getName());
     }
 
-    @BeforeEach
-    public void setUp() throws SQLException {
-        try (Connection connection = dataSource.getConnection();
-             Statement statement = connection.createStatement()) {
-            statement.execute(String.format("TRUNCATE TABLE %s.%s RESTART IDENTITY", SCHEMA_NAME, QUEUE_NAME));
-        }
+    @Test
+    public void testExistsNewMessages() {
+        assertTrue(queue.isMessagesExistsForState(MessageState.ACCEPTED));
+    }
+
+    @Test
+    public void testNPEForNullState() {
+        assertThrows(NullPointerException.class, () -> queue.isMessagesExistsForState(null));
     }
 
     @Test
     public void testPut() {
-        String payload = "Test message";
-        Message sentMessage = queue.put(Message.builder().payload(payload).build());
+        String payload = "Test put new message";
+        Message sentMessage = queue.put(payload);
         assertNotNull(sentMessage);
         assertAll("offset",
                 () -> assertNotNull(sentMessage.getOffset()),
                 () -> assertTrue(sentMessage.getOffset() > 0)
         );
-        assertEquals(MessageState.ACCEPTED, sentMessage.getState());
         assertNotNull(sentMessage.getDateAdded());
+        assertEquals(MessageState.ACCEPTED, sentMessage.getState());
         assertNull(sentMessage.getConsumerId());
+        assertNotNull(sentMessage.getStateUpdatedAt());
         assertEquals(payload, sentMessage.getPayload());
     }
 
     @Test
-    public void testFindNextAsync() throws Exception {
-        CompletableFuture<List<Message>> future = CompletableFuture.supplyAsync(() -> {
-            try {
-                return queue.findNext(CONSUMER_ID, 10);
-            } catch (InterruptedException e) {
-                throw new CompletionException(e);
-            }
-        });
+    public void testNPEWhenPutNullPayload() {
+        assertThrows(NullPointerException.class, () -> queue.put(null));
+    }
 
-        assertFalse(future.isDone());
-        Thread.sleep(1000);
+    @Test
+    public void testSelectNewMessages() {
+        List<Message> messages = queue.selectByStateAndUpdate(MessageState.ACCEPTED, 3, MessageState.SENT, CONSUMER_ID);
 
-        String payload = "Test message";
-        assertNotNull(queue.put(Message.builder().payload(payload).build()));
-
-        List<Message> messages = assertTimeoutPreemptively(ofSeconds(1800),
-                (ThrowingSupplier<List<Message>>) future::get);
-
-        assertAll("exactly one message",
-                () -> assertNotNull(messages),
-                () -> assertEquals(1, messages.size()));
+        assertFalse(messages.isEmpty());
+        assertEquals(1, messages.size());
 
         Message actualMessage = messages.get(0);
 
+        assertEquals(1, actualMessage.getOffset());
+        assertNotNull(actualMessage.getDateAdded());
         assertEquals(MessageState.SENT, actualMessage.getState());
+        assertNotNull(actualMessage.getStateUpdatedAt());
         assertEquals(CONSUMER_ID, actualMessage.getConsumerId());
-        assertEquals(payload, actualMessage.getPayload());
+        assertEquals("Test new message", actualMessage.getPayload());
     }
 
     @Test
-    public void testFindNextSync() {
-        List<Message> expectedEmpty = queue.findNextOrEmpty(CONSUMER_ID, 10);
-
-        assertAll("empty messages",
-                () -> assertNotNull(expectedEmpty),
-                () -> assertTrue(expectedEmpty.isEmpty()));
-
-        String payload = "Test message";
-        assertNotNull(queue.put(Message.builder().payload(payload).build()));
-
-        List<Message> messages = queue.findNextOrEmpty(CONSUMER_ID, 10);
-
-        assertAll("exactly one message",
-                () -> assertNotNull(messages),
-                () -> assertEquals(1, messages.size()));
-
-        Message actualMessage = messages.get(0);
-
-        assertEquals(MessageState.SENT, actualMessage.getState());
-        assertEquals(CONSUMER_ID, actualMessage.getConsumerId());
-        assertEquals(payload, actualMessage.getPayload());
+    public void testInvalidArgsForSelectNewMessages() {
+        assertThrows(NullPointerException.class, () -> queue.selectByStateAndUpdate(null, 3, MessageState.SENT, CONSUMER_ID));
+        assertThrows(NullPointerException.class, () -> queue.selectByStateAndUpdate(MessageState.ACCEPTED, 3, null, CONSUMER_ID));
+        assertThrows(NullPointerException.class, () -> queue.selectByStateAndUpdate(MessageState.ACCEPTED, 3, MessageState.SENT, null));
+        assertThrows(IllegalArgumentException.class, () -> queue.selectByStateAndUpdate(MessageState.ACCEPTED, 0, MessageState.SENT, CONSUMER_ID));
+        assertThrows(IllegalArgumentException.class, () -> queue.selectByStateAndUpdate(MessageState.ACCEPTED, 3, MessageState.ACCEPTED, CONSUMER_ID));
     }
 
     @Test
-    public void testResetUncommitted() {
-        String payload = "Test message";
-        assertNotNull(queue.put(Message.builder().payload(payload).build()));
-        List<Message> messages = queue.findNextOrEmpty(CONSUMER_ID, 10);
-
-        assertAll("exactly one message",
-                () -> assertNotNull(messages),
-                () -> assertEquals(1, messages.size()));
-
-        queue.resetAllUncommittedMessages(CONSUMER_ID);
-        List<Message> expectedMessages = queue.findNextOrEmpty(CONSUMER_ID, 10);
-
-        assertAll("exactly one message",
-                () -> assertNotNull(expectedMessages),
-                () -> assertEquals(1, expectedMessages.size()));
+    public void testUpdateStateByConsumerId() {
+        assertEquals(2, queue.updateStateByConsumerId(CONSUMER_ID, MessageState.SENT, MessageState.DELIVERED));
     }
 
     @Test
-    public void testCommitAllConsumed() {
-        String payload = "Test message";
-        assertNotNull(queue.put(Message.builder().payload(payload).build()));
-        List<Message> messages = queue.findNextOrEmpty(CONSUMER_ID, 10);
-
-        assertAll("exactly one message",
-                () -> assertNotNull(messages),
-                () -> assertEquals(1, messages.size()));
-
-        queue.commitAllConsumedMessages(CONSUMER_ID);
-        List<Message> expectedMessages = queue.findNextOrEmpty(CONSUMER_ID, 10);
-
-        assertAll("empty messages",
-                () -> assertNotNull(expectedMessages),
-                () -> assertTrue(expectedMessages.isEmpty()));
+    public void testInvalidArgsForUpdateStateByConsumerId() {
+        assertThrows(NullPointerException.class, () -> queue.updateStateByConsumerId(null, MessageState.SENT, MessageState.DELIVERED));
+        assertThrows(NullPointerException.class, () -> queue.updateStateByConsumerId(CONSUMER_ID, null, MessageState.DELIVERED));
+        assertThrows(NullPointerException.class, () -> queue.updateStateByConsumerId(CONSUMER_ID, MessageState.SENT, null));
     }
 
-    private static DataSource createDataSource() {
-        SimpleDriverDataSource ds = new SimpleDriverDataSource();
+    @Test
+    void testUpdateStateOlderThan() {
+        assertEquals(1, queue.updateStateOlderThan(MessageState.SENT, MessageState.ACCEPTED, 1, LocalDateTime.now()));
+    }
 
-        ds.setDriverClass(PGDriver.class);
-        ds.setUrl(postgreSQLContainer.getJdbcUrl().replace("postgresql", "pgsql").split("\\?")[0]);
-        ds.setUsername(postgreSQLContainer.getUsername());
-        ds.setPassword(postgreSQLContainer.getPassword());
+    @Test
+    void testInvalidArgsForUpdateStateOlderThan() {
+        assertThrows(NullPointerException.class, () -> queue.updateStateOlderThan(null, MessageState.ACCEPTED, 1, LocalDateTime.now()));
+        assertThrows(NullPointerException.class, () -> queue.updateStateOlderThan(MessageState.SENT, null, 1, LocalDateTime.now()));
+        assertThrows(NullPointerException.class, () -> queue.updateStateOlderThan(MessageState.SENT, MessageState.ACCEPTED, 1, null));
+        assertThrows(IllegalArgumentException.class, () -> queue.updateStateOlderThan(MessageState.SENT, MessageState.ACCEPTED, 0, LocalDateTime.now()));
+    }
 
-        return ds;
+    public static class Configuration {
+
+        @Bean
+        public DataSource dataSource() {
+            SimpleDriverDataSource ds = new SimpleDriverDataSource();
+
+            ds.setDriverClass(Driver.class);
+            ds.setUrl(postgreSQLContainer.getJdbcUrl());
+            ds.setUsername(postgreSQLContainer.getUsername());
+            ds.setPassword(postgreSQLContainer.getPassword());
+
+            return ds;
+        }
+
+        @Bean
+        public MessageQueue messageQueue(DataSource dataSource) {
+            return MessageQueue.builder()
+                    .jdbcTemplate(new NamedParameterJdbcTemplate(dataSource))
+                    .schema(SCHEMA_NAME)
+                    .queueName(QUEUE_NAME)
+                    .enableCleaner(10, 10, 7)
+                    .build();
+        }
     }
 }

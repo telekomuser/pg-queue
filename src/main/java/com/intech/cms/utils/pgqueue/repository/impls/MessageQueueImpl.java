@@ -1,191 +1,259 @@
 package com.intech.cms.utils.pgqueue.repository.impls;
 
-import com.impossibl.postgres.api.jdbc.PGConnection;
-import com.impossibl.postgres.api.jdbc.PGNotificationListener;
 import com.intech.cms.utils.pgqueue.model.Message;
 import com.intech.cms.utils.pgqueue.model.MessageState;
-import com.intech.cms.utils.pgqueue.repository.IMessageQueue;
+import com.intech.cms.utils.pgqueue.repository.MessageQueue;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.jdbc.core.namedparam.SqlParameterSource;
-import org.springframework.jdbc.support.GeneratedKeyHolder;
-import org.springframework.jdbc.support.KeyHolder;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
-import javax.sql.DataSource;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.LocalDateTime;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Slf4j
-public class MessageQueueImpl implements IMessageQueue, PGNotificationListener {
-    private final NamedParameterJdbcTemplate jdbcTemplate;
-    private final TransactionTemplate transactionTemplate;
+public class MessageQueueImpl implements MessageQueue {
+    private static final String CREATE_SCHEMA_SQL = "CREATE SCHEMA IF NOT EXISTS %s";
 
-    private final String queueName;
-    private final String tableName;
+    private static final String CREATE_TABLE_SQL = "CREATE TABLE IF NOT EXISTS %s ( " +
+            "    id                bigserial PRIMARY KEY, " +
+            "    date_added        timestamp NOT NULL, " +
+            "    state             smallint  NOT NULL, " +
+            "    state_updated_at  timestamp NOT NULL, " +
+            "    consumer_id       text, " +
+            "    payload           text      NOT NULL " +
+            ")";
 
-    private final Lock lock;
-    private final Condition newMessageEvent;
-
-    private final RowMapper<Message> messageMapper = (rs, rowNum) -> Message.builder()
+    private static final RowMapper<Message> MESSAGE_MAPPER = (rs, rowNum) -> Message.builder()
             .offset(rs.getLong("id"))
             .dateAdded(rs.getTimestamp("date_added").toLocalDateTime())
             .state(MessageState.getById(rs.getInt("state")))
+            .stateUpdatedAt(rs.getTimestamp("state_updated_at").toLocalDateTime())
             .consumerId(rs.getString("consumer_id"))
             .payload(rs.getString("payload"))
             .build();
 
+    private final String queueName;
+    private final NamedParameterJdbcTemplate jdbcTemplate;
+    private final Map<QueryType, String> sqlCache;
+    private final Optional<Cleaner> cleaner;
+
     protected MessageQueueImpl(NamedParameterJdbcTemplate jdbcTemplate,
-                               PlatformTransactionManager transactionManager,
                                String schema,
-                               String queueName) throws SQLException {
+                               String queueName,
+                               int cleanInterval,
+                               int cleanBatchSize,
+                               int messageAge) {
         this.jdbcTemplate = jdbcTemplate;
-        this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.queueName = queueName;
-        this.tableName = String.format("%s.%s", schema, queueName);
-        this.lock = new ReentrantLock();
-        this.newMessageEvent = this.lock.newCondition();
-        addListener(getConnection(), this);
+
+        String tableName = String.format("%s.%s", schema, queueName);
+        createSchemaIfNotExists(schema);
+        createTableIfNotExists(tableName);
+
+        this.sqlCache = prepareSqlCache(tableName);
+
+        this.cleaner = Optional.of(cleanInterval)
+                .filter(interval -> interval > 0)
+                .map(interval ->
+                        new Cleaner(
+                                String.format("%s-message-cleaner", queueName),
+                                interval,
+                                cleanBatchSize,
+                                messageAge
+                        )
+                );
+        this.cleaner.ifPresent(Cleaner::start);
     }
 
     @Override
-    public Message put(Message message) {
-        String sqlTemplate = "INSERT INTO %s (date_added, state, payload) VALUES (:date_added, :state, :payload)";
-        String sql = String.format(sqlTemplate, tableName);
+    public String getName() {
+        return queueName;
+    }
 
-        LocalDateTime dateAdded = LocalDateTime.now();
+    @Override
+    public boolean isMessagesExistsForState(MessageState state) {
+        Objects.requireNonNull(state);
+        String sql = getSqlFromCache(QueryType.IS_EXISTS);
+        Map<String, Integer> params = Collections.singletonMap("state", state.getId());
+
+        return Optional.ofNullable(jdbcTemplate.queryForObject(sql, params, Boolean.class))
+                .orElse(false);
+    }
+
+    @Override
+    public Message put(String payload) {
+        Objects.requireNonNull(payload);
+        String sql = getSqlFromCache(QueryType.SAVE);
 
         SqlParameterSource params = new MapSqlParameterSource()
-                .addValue("date_added", dateAdded)
-                .addValue("state", message.getState().getId())
-                .addValue("payload", message.getPayload());
-        KeyHolder keyHolder = new GeneratedKeyHolder();
+                .addValue("date_added", LocalDateTime.now())
+                .addValue("state", MessageState.ACCEPTED.getId())
+                .addValue("state_updated_at", LocalDateTime.now())
+                .addValue("payload", payload);
 
-        jdbcTemplate.update(sql, params, keyHolder, new String[]{"id"});
-
-        return Message.builder()
-                .offset(Objects.requireNonNull(keyHolder.getKeyAs(Long.class)))
-                .dateAdded(dateAdded)
-                .state(message.getState())
-                .payload(message.getPayload())
-                .build();
+        return jdbcTemplate.queryForObject(sql, params, MESSAGE_MAPPER);
     }
 
     @Override
-    public List<Message> findNext(String consumerId, int limit) throws InterruptedException {
-        List<Message> messages;
+    public List<Message> selectByStateAndUpdate(MessageState currentState, int limit, MessageState newState, String consumerId) {
+        Objects.requireNonNull(currentState);
+        Objects.requireNonNull(newState);
+        Objects.requireNonNull(consumerId);
 
-        while ((messages = selectAndUpdateState(consumerId, limit)).isEmpty()) {
-            try {
-                lock.lock();
-                log.debug("awaiting for a new messages...");
-                newMessageEvent.await();
-            } finally {
-                lock.unlock();
-            }
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must have positive value");
         }
 
-        return messages;
-    }
-
-    @Override
-    public List<Message> findNextOrEmpty(String consumerId, int limit) {
-        return selectAndUpdateState(consumerId, limit);
-    }
-
-    @Override
-    public void commitAllConsumedMessages(String consumerId) {
-        String sql = String.format("UPDATE %s SET state = 3 WHERE consumer_id = :id AND state = 2", tableName);
-        jdbcTemplate.update(sql, Collections.singletonMap("id", consumerId));
-        log.debug("Commit messages for consumer with id = {}", consumerId);
-    }
-
-    @Override
-    public void resetAllUncommittedMessages(String consumerId) {
-        String sql = String.format("UPDATE %s SET state = 1 WHERE consumer_id = :id AND state = 2", tableName);
-        jdbcTemplate.update(sql, Collections.singletonMap("id", consumerId));
-        log.debug("Reset uncommitted messages for consumer with id = {}", consumerId);
-    }
-
-    @Override
-    public void notification(int processId, String channelName, String payload) {
-        log.trace("got new notification from PID = {}, channel = {} with payload = {}", processId, channelName, payload);
-        try {
-            this.lock.lock();
-            this.newMessageEvent.signal();
-        } finally {
-            this.lock.unlock();
+        if (currentState == newState) {
+            throw new IllegalArgumentException("states should be different");
         }
-    }
 
-    @Override
-    public void closed() {
-        log.trace("lost connection, try reconnect...");
-        try {
-            PGConnection connection = getConnection();
-            log.trace("...connection restored, add listener");
-            addListener(connection, this);
-        } catch (SQLException e) {
-            //connection restore failed, perhaps application stopping
-        }
-    }
-
-    private List<Message> selectAndUpdateState(String consumerId, int limit) {
-        String sqlTemplate = "SELECT * FROM %s WHERE state = 1 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT %d";
-        String sql = String.format(sqlTemplate, tableName, limit);
-
-        return transactionTemplate.execute(status ->
-                jdbcTemplate.query(sql, Collections.emptyMap(), messageMapper).stream()
-                        .map(message -> markAsSentTo(message, consumerId))
-                        .collect(Collectors.toList())
-        );
-    }
-
-    private Message markAsSentTo(Message message, String consumerId) {
-        String sqlTemplate = "UPDATE %s SET state = :state, consumer_id = :consumer_id WHERE id = :id";
-        String sql = String.format(sqlTemplate, tableName);
-
+        String sql = getSqlFromCache(QueryType.SELECT_AND_UPDATE);
         SqlParameterSource params = new MapSqlParameterSource()
-                .addValue("state", MessageState.SENT.getId())
+                .addValue("current_state", currentState.getId())
+                .addValue("limit", limit)
+                .addValue("new_state", newState.getId())
+                .addValue("consumer_id", consumerId);
+
+        return jdbcTemplate.query(sql, params, MESSAGE_MAPPER);
+    }
+
+    @Override
+    public int updateStateByConsumerId(String consumerId, MessageState currentState, MessageState newState) {
+        Objects.requireNonNull(consumerId);
+        Objects.requireNonNull(currentState);
+        Objects.requireNonNull(newState);
+
+        String sql = getSqlFromCache(QueryType.UPDATE_STATE);
+        SqlParameterSource params = new MapSqlParameterSource()
                 .addValue("consumer_id", consumerId)
-                .addValue("id", message.getOffset());
+                .addValue("current_state", currentState.getId())
+                .addValue("new_state", newState.getId());
 
-        jdbcTemplate.update(sql, params);
-        return Message.builder()
-                .offset(message.getOffset())
-                .dateAdded(message.getDateAdded())
-                .state(MessageState.SENT)
-                .consumerId(consumerId)
-                .payload(message.getPayload())
-                .build();
+        return jdbcTemplate.update(sql, params);
     }
 
-    private PGConnection getConnection() throws SQLException {
-        return getDataSource().getConnection().unwrap(PGConnection.class);
-    }
+    @Override
+    public int updateStateOlderThan(MessageState currentState, MessageState newState, int limit, LocalDateTime dateTime) {
+        Objects.requireNonNull(currentState);
+        Objects.requireNonNull(newState);
+        Objects.requireNonNull(dateTime);
 
-    private void addListener(PGConnection connection, PGNotificationListener listener) throws SQLException {
-        connection.addNotificationListener(this.queueName, listener);
-
-        try (Statement statement = connection.createStatement()) {
-            statement.execute(String.format("LISTEN %s", this.queueName));
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must have positive value");
         }
 
-        log.trace("subscribed to channel: {}", this.queueName);
+        String sql = getSqlFromCache(QueryType.UPDATE_STATE_OLDER);
+        SqlParameterSource params = new MapSqlParameterSource()
+                .addValue("current_state", currentState.getId())
+                .addValue("new_state", newState.getId())
+                .addValue("limit",limit)
+                .addValue("date_time", dateTime);
+
+        return jdbcTemplate.update(sql, params);
+
     }
 
-    private DataSource getDataSource() {
-        return Objects.requireNonNull(jdbcTemplate.getJdbcTemplate().getDataSource());
+    @Override
+    public void close() {
+        cleaner.ifPresent(Cleaner::interrupt);
     }
+
+    private int deleteDeliveredMessagesOlderThan(int limit, LocalDateTime dateTime) {
+        String sql = getSqlFromCache(QueryType.DELETE_OLD);
+        SqlParameterSource params = new MapSqlParameterSource()
+                .addValue("state", MessageState.DELIVERED.getId())
+                .addValue("limit", limit)
+                .addValue("date_time", dateTime);
+
+        return jdbcTemplate.update(sql, params);
+    }
+
+    private void createSchemaIfNotExists(String schema) {
+        jdbcTemplate.getJdbcTemplate().execute(String.format(CREATE_SCHEMA_SQL, schema));
+    }
+
+    private void createTableIfNotExists(String tableName) {
+        jdbcTemplate.getJdbcTemplate().execute(String.format(CREATE_TABLE_SQL, tableName));
+    }
+
+    private Map<QueryType, String> prepareSqlCache(String tableName) {
+        return Stream.of(QueryType.values())
+                .collect(
+                        Collectors.toMap(
+                                Function.identity(),
+                                queryType -> String.format(queryType.getTemplate(), tableName)
+                        )
+                );
+    }
+
+    private String getSqlFromCache(QueryType queryType) {
+        return Optional.ofNullable(sqlCache.get(queryType))
+                .orElseThrow(IllegalStateException::new);
+    }
+
+    @Getter
+    @RequiredArgsConstructor
+    private enum QueryType {
+        IS_EXISTS("SELECT exists(SELECT 1 FROM %s WHERE state = :state)"),
+
+        SAVE("INSERT INTO %s (date_added, state, state_updated_at, payload) VALUES (:date_added, :state, :state_updated_at, :payload) RETURNING *"),
+
+        SELECT_AND_UPDATE("UPDATE %1$s SET state = :new_state, consumer_id = :consumer_id, state_updated_at = now() " +
+                "WHERE id IN (SELECT id FROM %1$s WHERE state = :current_state ORDER BY id FOR UPDATE SKIP LOCKED LIMIT :limit)" +
+                "RETURNING *"),
+
+        UPDATE_STATE("UPDATE %s SET state = :new_state, state_updated_at = now() WHERE consumer_id = :consumer_id AND state = :current_state"),
+
+        DELETE_OLD("DELETE FROM %1$s " +
+                "WHERE id IN (SELECT id FROM %1$s WHERE state = :state AND state_updated_at <= :date_time ORDER BY state_updated_at LIMIT :limit)"),
+
+        UPDATE_STATE_OLDER("UPDATE %1$s SET state = :new_state, state_updated_at = now() " +
+                " WHERE id IN (SELECT id FROM %1$s WHERE state = :current_state AND state_updated_at <= :date_time ORDER BY id FOR UPDATE SKIP LOCKED LIMIT :limit)");
+
+        private final String template;
+    }
+
+    private class Cleaner extends Thread {
+
+        private final int cleanInterval;
+        private final int cleanBatchSize;
+        private final int messageAge;
+
+        public Cleaner(String name, int cleanInterval, int cleanBatchSize, int messageAge) {
+            super(name);
+            this.cleanInterval = cleanInterval;
+            this.cleanBatchSize = cleanBatchSize;
+            this.messageAge = messageAge;
+            setDaemon(true);
+        }
+
+        @Override
+        public void run() {
+            log.info("message cleaner started...");
+
+            while (!isInterrupted()) {
+                try {
+                    Thread.sleep(cleanInterval * 1000L);
+                    int deleted = deleteDeliveredMessagesOlderThan(cleanBatchSize, LocalDateTime.now().minusDays(messageAge));
+                    log.info("deleted {} messages", deleted);
+                } catch (InterruptedException e) {
+                    log.info("cleaner was interrupted, stopping...");
+                    break;
+                } catch (Exception e) {
+                    log.error("", e);
+                }
+            }
+
+            log.info("...message cleaner stopped");
+        }
+    }
+
 }
