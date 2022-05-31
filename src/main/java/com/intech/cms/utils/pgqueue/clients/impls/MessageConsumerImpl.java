@@ -39,14 +39,14 @@ public class MessageConsumerImpl<T> implements MessageConsumer<T> {
         this.clazz = clazz;
         this.lock = new ReentrantLock();
         this.newMessageEvent = this.lock.newCondition();
-        this.poller = new Poller(String.format("%s-poller", queue.getName()), pollInterval);
+        this.poller = new Poller(String.format("%s-poller", queue.getName().replaceAll("_", "-")), pollInterval);
         this.poller.start();
 
         this.restorer = Optional.of(restoreInterval)
                 .filter(interval -> interval > 0)
                 .map(interval ->
                         new Restorer(
-                                String.format("%s-restore", queue.getName()),
+                                String.format("%s-restorer", queue.getName().replaceAll("_", "-")),
                                 interval,
                                 restoreLimit,
                                 restoreAge)
@@ -131,7 +131,7 @@ public class MessageConsumerImpl<T> implements MessageConsumer<T> {
 
         @Override
         public void run() {
-            log.info("poller started...");
+            log.info("{} started...", getName());
 
             while (!isInterrupted()) {
                 try {
@@ -143,14 +143,14 @@ public class MessageConsumerImpl<T> implements MessageConsumer<T> {
                         lock.unlock();
                     }
                 } catch (InterruptedException e) {
-                    log.info("poller interrupted, stopping...");
+                    log.info("{} interrupted, stopping...", getName());
                     break;
                 } catch (Exception e) {
                     log.error("", e);
                 }
             }
 
-            log.info("...poller stopped");
+            log.info("...{} stopped", getName());
         }
     }
 
@@ -169,7 +169,7 @@ public class MessageConsumerImpl<T> implements MessageConsumer<T> {
 
         @Override
         public void run() {
-            log.info("restorer started...");
+            log.info("{} started...", getName());
 
             while (!isInterrupted()) {
                 try {
@@ -182,14 +182,14 @@ public class MessageConsumerImpl<T> implements MessageConsumer<T> {
                     );
                     log.info("{} messages restored", restored);
                 } catch (InterruptedException e) {
-                    log.info("restorer interrupted, stopping...");
+                    log.info("{} interrupted, stopping...", getName());
                     break;
                 } catch (Exception e) {
                     log.error("", e);
                 }
             }
 
-            log.info("...restorer stopped");
+            log.info("...{} stopped", getName());
         }
     }
 

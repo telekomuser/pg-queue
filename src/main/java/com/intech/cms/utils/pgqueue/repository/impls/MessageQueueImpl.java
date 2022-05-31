@@ -63,7 +63,7 @@ public class MessageQueueImpl implements MessageQueue {
                 .filter(interval -> interval > 0)
                 .map(interval ->
                         new Cleaner(
-                                String.format("%s-message-cleaner", queueName),
+                                String.format("%s-message-cleaner", queueName.replaceAll("_", "-")),
                                 interval,
                                 cleanBatchSize,
                                 messageAge
@@ -237,7 +237,7 @@ public class MessageQueueImpl implements MessageQueue {
 
         @Override
         public void run() {
-            log.info("message cleaner started...");
+            log.info("{} started...", getName());
 
             while (!isInterrupted()) {
                 try {
@@ -245,14 +245,14 @@ public class MessageQueueImpl implements MessageQueue {
                     int deleted = deleteDeliveredMessagesOlderThan(cleanBatchSize, LocalDateTime.now().minusDays(messageAge));
                     log.info("deleted {} messages", deleted);
                 } catch (InterruptedException e) {
-                    log.info("cleaner was interrupted, stopping...");
+                    log.info("{} was interrupted, stopping...", getName());
                     break;
                 } catch (Exception e) {
                     log.error("", e);
                 }
             }
 
-            log.info("...message cleaner stopped");
+            log.info("...{} stopped", getName());
         }
     }
 
